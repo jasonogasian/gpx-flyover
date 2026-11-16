@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GPX flyover</title>
+<!-- Prototype: 3D flyover video of a GPS track over satellite imagery and terrain.
+     MapLibre GL JS renders the map; WebCodecs + mp4-muxer encode frames one at a time,
+     each frame waiting until its tiles have loaded, so the video is smooth whatever the
+     network does. Open this file in Chrome, Edge or Safari 17+ and drop a GPX or TCX file. -->
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@5.24.1/dist/maplibre-gl.css">
+<script src="https://unpkg.com/maplibre-gl@5.24.1/dist/maplibre-gl.js"></script>
+<style>
+  :root { --bg:#111418; --panel:#1b2027; --text:#e8ecf1; --muted:#9aa6b2; --accent:#ff6a2b; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--text);
+    font: 14px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  #app { display:flex; height:100%; }
+  #side { width:300px; padding:16px; background:var(--panel); overflow:auto; flex-shrink:0; }
+  #side h1 { font-size:18px; margin:0 0 4px; }
+  #side p.hint { color:var(--muted); margin:0 0 14px; font-size:13px; }
+  label { display:block; margin:10px 0 4px; color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
+  select, input[type=text], input[type=number] { width:100%; padding:7px 8px; background:#0d1014; color:var(--text);
+    border:1px solid #2c333c; border-radius:6px; font:inherit; }
+  input[type=range] { width:100%; }
+  button { width:100%; margin-top:10px; padding:9px; border:0; border-radius:6px; font:inherit; font-weight:600;
+    background:#2c333c; color:var(--text); cursor:pointer; }
+  button.primary { background:var(--accent); color:#fff; }
+  button:disabled { opacity:.45; cursor:default; }
+  #drop { border:2px dashed #3a434e; border-radius:8px; padding:16px; text-align:center; color:var(--muted); cursor:pointer; }
+  #drop.over { border-color:var(--accent); color:var(--text); }
+  #status { margin-top:12px; color:var(--muted); font-size:13px; min-height:2.8em; white-space:pre-line; }
+  #stage { flex:1; position:relative; overflow:hidden; display:flex; align-items:center; justify-content:center; background:#000; }
+  #frame { position:relative; }
+  #map, #overlay { position:absolute; inset:0; }
+  #overlay { pointer-events:none; width:100%; height:100%; }   /* drawn at device pixels, shown at CSS size */
+  #frame { overflow:hidden; }
+  progress { width:100%; margin-top:8px; }
+  .checks { display:grid; grid-template-columns:1fr 1fr; gap:2px 8px; }
+  .checks label { margin:0; text-transform:none; letter-spacing:0; font-size:13px; color:var(--text); display:flex; gap:6px; align-items:center; }
+  .row { display:flex; gap:8px; } .row > * { flex:1; }
+  @media (max-width: 760px) { #app { flex-direction:column-reverse; } #side { width:100%; height:45%; } }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="side">
+    <h1>GPX flyover</h1>
+    <p class="hint">Drop a GPX or TCX file (Garmin Connect: activity, gear menu, Export to GPX), preview, then export an MP4.</p>
+    <div id="drop">Drop GPX / TCX here<br>or click to choose</div>
+    <input id="file" type="file" accept=".gpx,.tcx" hidden>
+
+    <label>Title</label>
+    <input id="title" type="text" placeholder="Activity name">
+
+    <label>Stats on video</label>
+    <div class="checks">
+      <label><input type="checkbox" class="stat" value="dist" checked> Distance</label>
+      <label><input type="checkbox" class="stat" value="gain" checked> Climb so far</label>
+      <label><input type="checkbox" class="stat" value="time" checked> Elapsed time</label>
+      <label><input type="checkbox" class="stat" value="pace"> Pace</label>
+      <label><input type="checkbox" class="stat" value="avg"> Avg pace</label>
+      <label><input type="checkbox" class="stat" value="alt"> Altitude</label>
+    </div>
+
+    <label>Imagery</label>
+    <select id="imagery">
+      <option value="esri">Esri World Imagery (no key)</option>
+      <option value="maptiler">MapTiler Satellite (key)</option>
+      <option value="mapbox">Mapbox Satellite (token)</option>
+      <option value="s2">Sentinel-2 cloudless 2016 (CC BY, 10 m)</option>
+      <option value="none">Shaded relief only</option>
+    </select>
+    <div id="keyRow" hidden><label>API key / token</label><input id="key" type="text" placeholder="paste key"></div>
+
+    <div class="row">
+      <div><label>Length (s)</label><input id="duration" type="number" min="8" max="180" value="30"></div>
+      <div><label>FPS</label><select id="fps"><option>30</option><option>60</option><option>24</option></select></div>
+    </div>
+    <label>Quality</label>
+    <select id="quality">
+      <option value="6">Social media (~25 MB for 30 s)</option>
+      <option value="3">Small (~12 MB for 30 s)</option>
+      <option value="16">High (~60 MB for 30 s)</option>
+    </select>
+    <label>Video size</label>
+    <select id="size">
+      <option value="1920x1080">1920 x 1080 (landscape)</option>
+      <option value="1080x1920">1080 x 1920 (phone / stories)</option>
+      <option value="1080x1080">1080 x 1080 (square)</option>
+      <option value="1280x720">1280 x 720 (quick)</option>
+    </select>
+    <label>Camera distance <span id="zoomVal"></span></label>
+    <input id="zoom" type="range" min="12.5" max="16" step="0.1" value="14.4">
+    <label>Camera tilt <span id="pitchVal"></span></label>
+    <input id="pitch" type="range" min="30" max="80" step="1" value="56">
+    <label>Terrain exaggeration <span id="exagVal"></span></label>
+    <input id="exag" type="range" min="1" max="2.5" step="0.1" value="1.3">
+
+    <button id="play" disabled>Preview</button>
+    <button id="export" class="primary" disabled>Export MP4</button>
+    <progress id="prog" max="1" value="0" hidden></progress>
+    <div id="status"></div>
+  </div>
+  <div id="stage"><div id="frame"><div id="map"></div><canvas id="overlay"></canvas></div></div>
+</div>
+
+<script type="module">
+const $ = id => document.getElementById(id);
+const R = 6371008.8, toRad = d => d * Math.PI / 180, toDeg = r => r * 180 / Math.PI;
+const M_PER_MI = 1609.344, FT_PER_M = 3.28084;
+
+// ---------- imagery and terrain sources ----------
+const IMAGERY = {
+  esri: () => ({ tiles: ['https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'],
+    tileSize: 256, maxzoom: 19, attribution: 'Imagery © Esri, Maxar, Earthstar Geographics' }),
+  maptiler: k => ({ tiles: [`https://api.maptiler.com/tiles/satellite-v2/{z}/{x}/{y}.jpg?key=${k}`],
+    tileSize: 256, maxzoom: 20, attribution: '© MapTiler © Maxar' }),
+  mapbox: k => ({ tiles: [`https://api.mapbox.com/v4/mapbox.satellite/{z}/{x}/{y}@2x.jpg90?access_token=${k}`],
+    tileSize: 512, maxzoom: 19, attribution: '© Mapbox © Maxar' }),
+  s2: () => ({ tiles: ['https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless_3857/default/g/{z}/{y}/{x}.jpg'],
+    tileSize: 256, maxzoom: 15, attribution: 'Sentinel-2 cloudless 2016 by EOX (CC BY 4.0)' }),
+};
+// Mapzen/Tilezen terrain on AWS Open Data: free, no key.
+const TERRAIN = { type: 'raster-dem', encoding: 'terrarium', tileSize: 256, maxzoom: 15,
+  tiles: ['https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png'],
+  attribution: 'Terrain: Mapzen, AWS Open Data' };
+
+function buildStyle() {
+  const kind = $('imagery').value, key = $('key').value.trim();
+  const sources = { dem: TERRAIN, demShade: { ...TERRAIN } };
+  const layers = [{ id: 'bg', type: 'background', paint: { 'background-color': '#2a3138' } }];
+  if (kind !== 'none' && IMAGERY[kind]) {
+    sources.sat = { type: 'raster', ...IMAGERY[kind](key) };
+    layers.push({ id: 'sat', type: 'raster', source: 'sat', paint: { 'raster-fade-duration': 0 } });
+  } else {
+    layers.push({ id: 'shade', type: 'hillshade', source: 'demShade',
+      paint: { 'hillshade-shadow-color': '#1b232b', 'hillshade-highlight-color': '#c9d3c2', 'hillshade-accent-color': '#55605a' } });
+  }
+  return { version: 8, sources, layers, terrain: { source: 'dem', exaggeration: +$('exag').value },
+    sky: { 'sky-color': '#7fb0e0', 'horizon-color': '#dfe9f2', 'fog-color': '#dfe9f2',
+      'sky-horizon-blend': 0.6, 'horizon-fog-blend': 0.5, 'fog-ground-blend': 0.85, 'atmosphere-blend': 0.6 } };
+}
+
+// ---------- track parsing ----------
+function parseTrack(text) {
+  const doc = new DOMParser().parseFromString(text, 'application/xml');
+  const pts = [];
+  const num = (el, tag) => { const n = el.getElementsByTagName(tag)[0]; return n ? parseFloat(n.textContent) : NaN; };
+  const time = (el) => { const n = el.getElementsByTagName('time')[0] || el.getElementsByTagName('Time')[0];
+    return n ? Date.parse(n.textContent) : NaN; };
+  let nodes = [...doc.getElementsByTagName('trkpt')];
+  if (!nodes.length) nodes = [...doc.getElementsByTagName('rtept')];
+  for (const el of nodes) pts.push({ lat: +el.getAttribute('lat'), lon: +el.getAttribute('lon'), ele: num(el, 'ele'), t: time(el) });
+  if (!pts.length) for (const el of doc.getElementsByTagName('Trackpoint')) {   // TCX
+    const lat = num(el, 'LatitudeDegrees'), lon = num(el, 'LongitudeDegrees');
+    if (isFinite(lat) && isFinite(lon)) pts.push({ lat, lon, ele: num(el, 'AltitudeMeters'), t: time(el) });
+  }
+  const name = (doc.getElementsByTagName('name')[0] || {}).textContent || '';
+  return { name: name.trim(), pts: pts.filter(p => isFinite(p.lat) && isFinite(p.lon)) };
+}
+
+function haversine(a, b) {
+  const dLat = toRad(b.lat - a.lat), dLon = toRad(b.lon - a.lon);
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
+// Resample to even spacing so smoothing and timing work in distance, not in GPS sample rate.
+function prepare(raw) {
+  const cum = [0];
+  for (let i = 1; i < raw.length; i++) cum.push(cum[i - 1] + haversine(raw[i - 1], raw[i]));
+  const total = cum[cum.length - 1], step = Math.max(5, total / 6000), out = [];
+  let j = 0;
+  for (let s = 0; s <= total; s += step) {
+    while (j < raw.length - 2 && cum[j + 1] < s) j++;
+    const a = raw[j], b = raw[j + 1] || a, seg = (cum[j + 1] - cum[j]) || 1, f = Math.min(1, Math.max(0, (s - cum[j]) / seg));
+    const lerp = (x, y) => (isFinite(x) && isFinite(y)) ? x + (y - x) * f : (isFinite(x) ? x : y);
+    out.push({ lat: lerp(a.lat, b.lat), lon: lerp(a.lon, b.lon), ele: lerp(a.ele, b.ele), t: lerp(a.t, b.t), s });
+  }
+  const eles = out.map(p => p.ele).filter(isFinite);
+  // Climb so far, counted with a 3 m dead band so GPS and barometer wobble doesn't inflate it.
+  let gain = 0, anchor = null;
+  for (const p of out) {
+    if (isFinite(p.ele)) {
+      if (anchor === null) anchor = p.ele;
+      else if (p.ele > anchor + 3) { gain += p.ele - anchor; anchor = p.ele; }
+      else if (p.ele < anchor - 3) anchor = p.ele;
+    }
+    p.gain = gain;
+  }
+  // Pace over the last ~400 m (seconds per metre), where the file has times.
+  const back = Math.max(1, Math.round(400 / step));
+  out.forEach((p, i) => { const q = out[Math.max(0, i - back)];
+    p.pace = (isFinite(p.t) && isFinite(q.t) && p.s - q.s > 50) ? (p.t - q.t) / 1000 / (p.s - q.s) : NaN; });
+  return { pts: out, total, step, gain, minE: Math.min(...eles), maxE: Math.max(...eles), hasEle: eles.length > 0,
+    t0: out[0].t, coords: out.map(p => [p.lon, p.lat]) };
+}
+
+// ---------- camera path ----------
+// Smoothing is set in seconds of video, not metres: a 50K squeezed into 30 s covers ~2 km a second,
+// so the camera must ignore bends a slow 5K flyover would follow. Heading is smoothed twice
+// (positions, then the angle itself) so switchbacks become one slow sweep instead of a swing.
+function gauss(n, sigmaIdx, get) {
+  const r = Math.max(1, Math.ceil(3 * sigmaIdx)), w = [];
+  for (let k = -r; k <= r; k++) w.push(Math.exp(-0.5 * (k / Math.max(sigmaIdx, 1e-6)) ** 2));
+  const out = new Array(n);
+  for (let i = 0; i < n; i++) { let acc = 0, ws = 0;
+    for (let k = -r; k <= r; k++) { acc += get(Math.min(n - 1, Math.max(0, i + k))) * w[k + r]; ws += w[k + r]; }
+    out[i] = acc / ws; }
+  return out;
+}
+// Fly-in and pull-back lengths as fractions of the video (at least 2 s each, so they never whip).
+const phases = dur => ({ intro: Math.min(3.5, Math.max(2, dur * 0.12)) / dur, outro: Math.min(4, Math.max(2, dur * 0.14)) / dur });
+let camCache = null;
+function cameraPath(dur) {
+  const key = dur + ':' + track.total;
+  if (camCache && camCache.key === key) return camCache;
+  const { pts, step, total } = track, n = pts.length;
+  const { intro, outro } = phases(dur), mainSec = dur * (1 - intro - outro);
+  const mps = total / Math.max(1, mainSec), cap = total / 6, toIdx = m => Math.min(m, cap) / step;
+  const smoothPos = sig => { const la = gauss(n, sig, i => pts[i].lat), lo = gauss(n, sig, i => pts[i].lon); return la.map((v, i) => [lo[i], v]); };
+  const look = smoothPos(toIdx(Math.max(60, 0.35 * mps)));
+  const head = smoothPos(toIdx(Math.max(350, 1.2 * mps)));
+  const ahead = Math.max(1, Math.round(toIdx(Math.max(250, 0.8 * mps))));
+  let prev = null;
+  const raw = head.map((p, i) => {
+    const q = head[Math.min(n - 1, i + ahead)], o = head[Math.max(0, i - ahead)];
+    const y = Math.sin(toRad(q[0] - o[0])) * Math.cos(toRad(q[1])),
+      x = Math.cos(toRad(o[1])) * Math.sin(toRad(q[1])) - Math.sin(toRad(o[1])) * Math.cos(toRad(q[1])) * Math.cos(toRad(q[0] - o[0]));
+    let b = toDeg(Math.atan2(y, x));
+    if (prev !== null) b = prev + (((b - prev) % 360) + 540) % 360 - 180;   // unwrap so it never spins the long way
+    return prev = b;
+  });
+  const smoothB = gauss(n, toIdx(Math.max(300, 2.0 * mps)), i => raw[i]);
+  // Then cap the turn rate at ~25 degrees per second of video (forward and backward passes averaged, so no lag).
+  const lim = 25 * step / mps, fw = smoothB.slice(), bw = smoothB.slice();
+  for (let i = 1; i < n; i++) fw[i] = fw[i - 1] + Math.max(-lim, Math.min(lim, fw[i] - fw[i - 1]));
+  for (let i = n - 2; i >= 0; i--) bw[i] = bw[i + 1] + Math.max(-lim, Math.min(lim, bw[i] - bw[i + 1]));
+  const bearing = fw.map((v, i) => (v + bw[i]) / 2);
+  return camCache = { key, look, bearing };
+}
+
+// ---------- map ----------
+let map, track = null, overview = null, playing = false;
+function initMap() {
+  map = new maplibregl.Map({ container: 'map', style: buildStyle(), center: [-122.6, 37.9], zoom: 10, pitch: 0,
+    maxPitch: 85, attributionControl: false, fadeDuration: 0, canvasContextAttributes: { preserveDrawingBuffer: true, antialias: true } });
+  map.on('style.load', addTrackLayers);
+}
+function addTrackLayers() {
+  if (!track || map.getSource('route')) return;
+  map.addSource('route', { type: 'geojson', data: lineTo(track.coords.length - 1) });
+  map.addSource('done', { type: 'geojson', data: lineTo(0) });
+  map.addSource('head', { type: 'geojson', data: pointAt(0) });
+  map.addLayer({ id: 'route-all', type: 'line', source: 'route', layout: { 'line-join': 'round', 'line-cap': 'round' },
+    paint: { 'line-color': '#ffffff', 'line-opacity': 0.45, 'line-width': 3 } });
+  map.addLayer({ id: 'route-done', type: 'line', source: 'done', layout: { 'line-join': 'round', 'line-cap': 'round' },
+    paint: { 'line-width': 5, 'line-color': '#ff6a2b' } });
+  map.addLayer({ id: 'head-glow', type: 'circle', source: 'head', paint: { 'circle-radius': 14, 'circle-color': '#ff6a2b', 'circle-opacity': 0.3, 'circle-pitch-alignment': 'map' } });
+  map.addLayer({ id: 'head', type: 'circle', source: 'head', paint: { 'circle-radius': 6, 'circle-color': '#ff6a2b', 'circle-stroke-color': '#fff', 'circle-stroke-width': 2 } });
+}
+// The part already run, redrawn each frame (a line-gradient on line-progress smeared across tiles in testing).
+const lineTo = i => ({ type: 'Feature', geometry: { type: 'LineString', coordinates: track.coords.slice(0, Math.max(2, i + 1)) } });
+const pointAt = i => ({ type: 'Feature', geometry: { type: 'Point', coordinates: track ? track.coords[i] : [0, 0] } });
+
+// ---------- timeline: intro fly-in, follow, outro pull-back ----------
+const ease = t => t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2;
+const lerp = (a, b, t) => a + (b - a) * t;
+// Zoom is set for a 540 px short side, so preview and export frame the same view at any size.
+const zoomAdj = () => Math.log2(Math.min(map.getContainer().clientWidth, map.getContainer().clientHeight) / 540);
+function chaseAt(i, dur) { const c = cameraPath(dur);
+  return { center: c.look[i], bearing: c.bearing[i], pitch: +$('pitch').value, zoom: +$('zoom').value + zoomAdj() }; }
+function computeOverview() {
+  const b = track.coords.reduce((bb, c) => bb.extend(c), new maplibregl.LngLatBounds(track.coords[0], track.coords[0]));
+  const w = map.getContainer().clientWidth, h = map.getContainer().clientHeight;
+  const b0 = cameraPath(+$('duration').value).bearing[0];
+  const cam = map.cameraForBounds(b, { padding: { top: h * 0.18, bottom: h * 0.22, left: w * 0.12, right: w * 0.12 }, bearing: b0 });
+  overview = { center: [cam.center.lng, cam.center.lat], zoom: cam.zoom - 0.6, pitch: 50, bearing: b0 };
+}
+// t in [0,1] over the whole video -> camera and how far along the route the runner is.
+function frameAt(t, dur) {
+  const { intro, outro } = phases(dur), n = track.coords.length - 1;
+  let cam, prog;
+  if (t < intro) {
+    const k = ease(t / intro), c = chaseAt(0, dur);
+    cam = { center: [lerp(overview.center[0], c.center[0], k), lerp(overview.center[1], c.center[1], k)],
+      zoom: lerp(overview.zoom, c.zoom, k), pitch: lerp(overview.pitch, c.pitch, k), bearing: lerp(overview.bearing, c.bearing, k) };
+    prog = 0;
+  } else if (t <= 1 - outro) {
+    const u = (t - intro) / (1 - intro - outro);
+    // Gentle ease at both ends of the run so the start and finish don't jerk.
+    const v = u < 0.04 ? 0.04 * ease(u / 0.04 / 2) * 2 : u > 0.96 ? 0.96 + 0.04 * (ease(0.5 + (u - 0.96) / 0.04 / 2) - 0.5) * 2 : u;
+    prog = v; cam = chaseAt(Math.round(v * n), dur);
+  } else {
+    const k = ease((t - (1 - outro)) / outro), c = chaseAt(n, dur), endB = c.bearing + 20;
+    cam = { center: [lerp(c.center[0], overview.center[0], k), lerp(c.center[1], overview.center[1], k)],
+      zoom: lerp(c.zoom, overview.zoom, k), pitch: lerp(c.pitch, overview.pitch, k), bearing: lerp(c.bearing, endB, k) };
+    prog = 1;
+  }
+  return { cam, prog, idx: Math.round(prog * n) };
+}
+function applyFrame(f) {
+  map.jumpTo(f.cam);
+  map.getSource('done').setData(lineTo(f.idx));
+  map.getSource('head').setData(pointAt(f.idx));
+}
+
+// ---------- overlay (drawn on a 2D canvas so it lands in the video too) ----------
+function fmtDur(ms) { const s = Math.round(ms / 1000), h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60);
+  return h ? `${h}:${String(m).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}` : `${m}:${String(s % 60).padStart(2, '0')}`; }
+let lastFrame = { prog: 0, idx: 0 };
+function drawOverlay(ctx, W, H, f) {
+  lastFrame = f;
+  ctx.clearRect(0, 0, W, H);
+  const u = Math.min(W, H) / 1080, pad = 40 * u, p = track.pts[f.idx];
+  const g = ctx.createLinearGradient(0, 0, 0, 220 * u); g.addColorStop(0, 'rgba(0,0,0,.55)'); g.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, 280 * u);
+  ctx.fillStyle = '#fff'; ctx.textBaseline = 'top'; ctx.shadowColor = 'rgba(0,0,0,.5)'; ctx.shadowBlur = 6 * u;
+  const title = $('title').value || 'My route';
+  ctx.font = `700 ${46 * u}px system-ui, sans-serif`;
+  const tw = ctx.measureText(title).width, tsz = 46 * u * Math.min(1, (W - 2 * pad) / tw);   // shrink a long title to fit
+  ctx.font = `700 ${tsz}px system-ui, sans-serif`; ctx.fillText(title, pad, pad);
+  const on = new Set([...document.querySelectorAll('.stat:checked')].map(c => c.value)), stats = [];
+  if (on.has('dist')) stats.push([`${(p.s / M_PER_MI).toFixed(1)}`, 'mi']);
+  if (on.has('gain') && track.hasEle) stats.push([`${Math.round(p.gain * FT_PER_M).toLocaleString()}`, 'ft climb']);
+  if (on.has('time') && isFinite(p.t) && isFinite(track.t0)) stats.push([fmtDur(p.t - track.t0), '']);
+  // Paces show --:-- until there's enough distance to measure (first ~50 m), so the row never jumps.
+  const fmtPace = spm => { if (!isFinite(spm)) return '--:--'; const sec = Math.round(spm * M_PER_MI); return `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}`; };
+  const timed = isFinite(track.t0);
+  if (on.has('pace') && timed) stats.push([fmtPace(p.pace), '/mi']);
+  if (on.has('avg') && timed) stats.push([fmtPace(isFinite(p.t) && p.s > 50 ? (p.t - track.t0) / 1000 / p.s : NaN), '/mi avg']);
+  if (on.has('alt') && isFinite(p.ele)) stats.push([`${Math.round(p.ele * FT_PER_M).toLocaleString()}`, 'ft alt']);
+  let x = pad, y = pad + 62 * u;   // wraps to a second row on narrow (portrait) frames
+  for (const [v, unit] of stats) {
+    ctx.font = `600 ${38 * u}px system-ui, sans-serif`; const vw = ctx.measureText(v).width;
+    ctx.font = `500 ${24 * u}px system-ui, sans-serif`; const uw = ctx.measureText(unit).width;
+    if (x > pad && x + vw + 6 * u + uw > W - pad) { x = pad; y += 50 * u; }
+    ctx.font = `600 ${38 * u}px system-ui, sans-serif`; ctx.fillStyle = '#fff'; ctx.fillText(v, x, y);
+    ctx.font = `500 ${24 * u}px system-ui, sans-serif`; ctx.fillStyle = 'rgba(255,255,255,.8)'; ctx.fillText(unit, x + vw + 6 * u, y + 12 * u);
+    ctx.fillStyle = '#fff'; x += vw + uw + 40 * u;
+  }
+  ctx.shadowBlur = 0;
+  // Elevation profile along the bottom with the current position.
+  if (track.hasEle) {
+    const ph = 64 * u, py = H - ph - 40 * u, pw = W - 2 * pad, n = track.pts.length, span = Math.max(1, track.maxE - track.minE);
+    const yAt = e => py + ph - ((isFinite(e) ? e : track.minE) - track.minE) / span * ph;
+    ctx.beginPath(); ctx.moveTo(pad, py + ph);
+    for (let i = 0; i < n; i += Math.max(1, Math.floor(n / 600))) ctx.lineTo(pad + i / (n - 1) * pw, yAt(track.pts[i].ele));
+    ctx.lineTo(pad + pw, py + ph); ctx.closePath(); ctx.fillStyle = 'rgba(255,255,255,.18)'; ctx.fill();
+    ctx.save(); ctx.beginPath(); ctx.rect(pad, py - 4, pw * f.prog, ph + 8); ctx.clip();
+    ctx.beginPath(); ctx.moveTo(pad, py + ph);
+    for (let i = 0; i < n; i += Math.max(1, Math.floor(n / 600))) ctx.lineTo(pad + i / (n - 1) * pw, yAt(track.pts[i].ele));
+    ctx.lineTo(pad + pw, py + ph); ctx.closePath(); ctx.fillStyle = 'rgba(255,106,43,.75)'; ctx.fill(); ctx.restore();
+    ctx.beginPath(); ctx.arc(pad + f.prog * pw, yAt(p.ele), 7 * u, 0, 7); ctx.fillStyle = '#fff'; ctx.fill();
+  }
+  const attr = [...new Set(Object.values(map.getStyle().sources).map(s => s.attribution).filter(Boolean))].join(' · ');
+  ctx.font = `400 ${16 * u}px system-ui, sans-serif`; ctx.textBaseline = 'bottom'; ctx.textAlign = 'right';
+  ctx.fillStyle = 'rgba(255,255,255,.75)'; ctx.fillText(attr, W - 14 * u, H - 10 * u); ctx.textAlign = 'left';
+}
+
+// ---------- stage sizing: preview keeps the video's aspect ratio ----------
+function videoSize() { const [w, h] = $('size').value.split('x').map(Number); return { w, h }; }
+function fitStage() {
+  const { w, h } = videoSize(), st = $('stage'), sc = Math.min(st.clientWidth / w, st.clientHeight / h);
+  setFrameSize(Math.floor(w * sc), Math.floor(h * sc));
+}
+function setFrameSize(w, h) {
+  $('frame').style.width = w + 'px'; $('frame').style.height = h + 'px';
+  const o = $('overlay'), dpr = window.devicePixelRatio || 1; o.width = w * dpr; o.height = h * dpr;
+  map && map.resize();
+}
+
+// ---------- preview ----------
+function preview() {
+  if (playing) { playing = false; return; }
+  playing = true; $('play').textContent = 'Stop'; computeOverview();
+  const dur = +$('duration').value, start = performance.now(), o = $('overlay'), ctx = o.getContext('2d');
+  const tick = () => {
+    const t = Math.min(1, (performance.now() - start) / 1000 / dur);
+    const f = frameAt(t, dur); applyFrame(f); drawOverlay(ctx, o.width, o.height, f);
+    if (playing && t < 1) requestAnimationFrame(tick); else { playing = false; $('play').textContent = 'Preview'; }
+  };
+  requestAnimationFrame(tick);
+}
+
+// ---------- export: render each frame, wait for its tiles, encode with WebCodecs ----------
+const waitIdle = (ms = 15000) => new Promise(res => { let done = false; const fin = () => { if (!done) { done = true; res(); } };
+  map.once('idle', fin); setTimeout(fin, ms); });
+// Quality is megabits per second for 1080p at 30 fps, scaled by pixel count and (less than linearly) by frame rate.
+// Social apps re-encode to roughly 3.5 to 6 Mbps anyway, so more than ~6 only makes a bigger file.
+function bitrateFor(w, h, fps) { return Math.round(+$('quality').value * 1e6 * (w * h) / (1920 * 1080) * (fps / 30) ** 0.6); }
+async function pickCodec(w, h, fps) {
+  const tries = [['avc', 'avc1.640033'], ['vp9', 'vp09.00.51.08'], ['av1', 'av01.0.12M.08']];
+  for (const [kind, codec] of tries) {
+    const cfg = { codec, width: w, height: h, bitrate: bitrateFor(w, h, fps), bitrateMode: 'variable', framerate: fps };
+    if (kind === 'avc') cfg.avc = { format: 'avc' };
+    try { if ((await VideoEncoder.isConfigSupported(cfg)).supported) return { kind, cfg }; } catch (e) {}
+  }
+  throw new Error('This browser cannot encode video with WebCodecs. Try Chrome or Edge.');
+}
+async function exportVideo() {
+  if (!('VideoEncoder' in window)) { status('This browser has no WebCodecs. Use Chrome, Edge or Safari 17+.'); return; }
+  playing = false;
+  const { Muxer, ArrayBufferTarget } = await import('https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/+esm');
+  const { w, h } = videoSize(), fps = +$('fps').value, dur = +$('duration').value, total = Math.round(dur * fps);
+  const btns = [$('export'), $('play')]; btns.forEach(b => b.disabled = true);
+  $('prog').hidden = false; $('prog').value = 0;
+  const prevDpr = map.getPixelRatio(); setFrameSize(w / 2, h / 2); map.setPixelRatio(2);
+  map.setTerrain({ source: 'dem', exaggeration: +$('exag').value });
+  $('frame').style.transform = `scale(${Math.min($('stage').clientWidth / (w / 2), $('stage').clientHeight / (h / 2))})`;
+  $('frame').style.transformOrigin = 'center';
+  computeOverview();
+  try {
+    const { kind, cfg } = await pickCodec(w, h, fps);
+    const muxer = new Muxer({ target: new ArrayBufferTarget(), video: { codec: kind, width: w, height: h, frameRate: fps }, fastStart: 'in-memory' });
+    let encErr = null;
+    const enc = new VideoEncoder({ output: (chunk, meta) => muxer.addVideoChunk(chunk, meta), error: e => encErr = e });
+    enc.configure(cfg);
+    const comp = new OffscreenCanvas(w, h), cctx = comp.getContext('2d'), ov = new OffscreenCanvas(w, h), octx = ov.getContext('2d');
+    const t0 = performance.now();
+    for (let i = 0; i < total; i++) {
+      if (encErr) throw encErr;
+      const f = frameAt(i / (total - 1), dur); applyFrame(f); await waitIdle();
+      cctx.drawImage(map.getCanvas(), 0, 0, w, h); drawOverlay(octx, w, h, f); cctx.drawImage(ov, 0, 0);
+      const vf = new VideoFrame(comp, { timestamp: Math.round(i * 1e6 / fps), duration: Math.round(1e6 / fps) });
+      enc.encode(vf, { keyFrame: i % (fps * 2) === 0 }); vf.close();
+      while (enc.encodeQueueSize > 8) await new Promise(r => setTimeout(r, 5));
+      if (i % 5 === 0) { $('prog').value = i / total; const el = (performance.now() - t0) / 1000;
+        status(`Rendering frame ${i + 1} of ${total} (${kind.toUpperCase()})\n~${Math.round(el / (i + 1) * (total - i - 1))} s left`); }
+    }
+    await enc.flush(); muxer.finalize();
+    const blob = new Blob([muxer.target.buffer], { type: 'video/mp4' });
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+    a.download = (($('title').value || 'gpx') + '-flyover.mp4').replace(/[^\w.-]+/g, '-'); a.click();
+    status(`Done: ${(blob.size / 1e6).toFixed(1)} MB ${kind.toUpperCase()} MP4 in ${Math.round((performance.now() - t0) / 1000)} s.` +
+      (kind !== 'avc' ? '\n(No H.264 encoder here; VP9/AV1 MP4 plays in Chrome but not QuickTime.)' : ''));
+    window.__lastVideo = blob;   // handy for automated tests
+  } catch (e) { status('Export failed: ' + e.message); console.error(e); }
+  finally {
+    $('frame').style.transform = ''; map.setPixelRatio(prevDpr); fitStage(); $('prog').hidden = true;
+    btns.forEach(b => b.disabled = false);
+  }
+}
+
+// ---------- wiring ----------
+function status(s) { $('status').textContent = s; }
+async function loadFile(file) {
+  const { name, pts } = parseTrack(await file.text());
+  if (pts.length < 2) { status('No track points found in that file.'); return; }
+  track = prepare(pts);
+  if (!$('title').value) $('title').value = name || file.name.replace(/\.\w+$/, '');
+  status(`${(track.total / M_PER_MI).toFixed(1)} mi` + (track.hasEle ? `, ${Math.round(track.gain * FT_PER_M).toLocaleString()} ft climb` : '') + `, ${pts.length.toLocaleString()} points`);
+  if (map.isStyleLoaded() && map.getSource('route')) { ['head', 'head-glow', 'route-done', 'route-all'].forEach(l => map.removeLayer(l)); ['route', 'done', 'head'].forEach(s => map.removeSource(s)); }
+  if (map.isStyleLoaded()) addTrackLayers();
+  computeOverview(); map.jumpTo(overview);
+  const o = $('overlay'); drawOverlay(o.getContext('2d'), o.width, o.height, { prog: 0, idx: 0 });
+  $('play').disabled = $('export').disabled = false;
+}
+window.loadTrackText = (text, filename = 'track.gpx') => loadFile(new File([text], filename));   // for tests
+$('drop').onclick = () => $('file').click();
+$('file').onchange = e => e.target.files[0] && loadFile(e.target.files[0]);
+$('drop').ondragover = e => { e.preventDefault(); $('drop').classList.add('over'); };
+$('drop').ondragleave = () => $('drop').classList.remove('over');
+$('drop').ondrop = e => { e.preventDefault(); $('drop').classList.remove('over'); e.dataTransfer.files[0] && loadFile(e.dataTransfer.files[0]); };
+document.querySelectorAll('.stat').forEach(c => c.onchange = () => { if (track && !playing) { const o = $('overlay'); drawOverlay(o.getContext('2d'), o.width, o.height, lastFrame); } });
+$('play').onclick = preview; $('export').onclick = exportVideo;
+const saved = k => { try { return localStorage.getItem(k); } catch (e) { return null; } };
+$('key').value = saved('flyover-key') || '';
+$('imagery').onchange = () => { $('keyRow').hidden = !['maptiler', 'mapbox'].includes($('imagery').value); map.setStyle(buildStyle()); };
+$('key').onchange = () => { try { localStorage.setItem('flyover-key', $('key').value.trim()); } catch (e) {} map.setStyle(buildStyle()); };
+$('exag').oninput = () => { $('exagVal').textContent = $('exag').value + 'x'; if (map.isStyleLoaded()) map.setTerrain({ source: 'dem', exaggeration: +$('exag').value }); };
+$('pitch').oninput = () => { $('pitchVal').textContent = $('pitch').value + '°'; };
+$('zoom').oninput = () => { $('zoomVal').textContent = '(zoom ' + $('zoom').value + ')'; };
+$('size').onchange = () => { fitStage(); track && computeOverview(); };
+initMap();
+['exag', 'pitch', 'zoom'].forEach(id => $(id).oninput());
+window.addEventListener('resize', fitStage);
+fitStage();
+window.__map = map; window.__frameAt = (t, d) => { computeOverview(); return frameAt(t, d); }; window.__apply = f => { applyFrame(f); const o = $("overlay"); drawOverlay(o.getContext("2d"), o.width, o.height, f); };
+</script>
+</body>
+</html>
